@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-30 - Version 1.3.9
+
+**Deutsch**
+
+- Der Opus-Dekoder ist ausgebaut: Die Firmware wird um rund 160 KB kleiner (1,93 statt 2,09 MB) und lässt wieder Platz für Neues. Webradios und Dateien im Opus-Format spielen nicht mehr; MP3 und Vorbis laufen wie bisher.
+- Zwei Mischspuren: Läuft eine SD-Datei über dem Radio, kommt eine Flash-MP3 oder ein Text auf eine zweite Spur darüber. SD-Datei und Radio werden abgesenkt und spielen danach weiter; die SD-Datei wird nicht mehr durch die Ansage ersetzt.
+- Die Tabs stehen in der Reihenfolge der Rangfolge: MP3 (Flash), Sprechen, SD-Karte, Webradio, danach die übrigen. Beim Öffnen der Seite ist der erste Tab, MP3 (Flash), aktiv.
+
+**English**
+
+- The Opus decoder is removed: the firmware gets about 160 KB smaller (1.93 instead of 2.09 MB) and leaves room for new features again. Web radios and files in Opus format no longer play; MP3 and Vorbis work as before.
+- Two mix tracks: if an SD file runs over the radio, a flash MP3 or a text goes onto a second track above it. SD file and radio are lowered and continue afterwards; the SD file is no longer replaced by the announcement.
+- The tabs follow the playback priority: MP3 (Flash), Sprechen, SD-Karte, Webradio, then the others. When the page opens, the first tab, MP3 (Flash), is active.
+
 ## 2026-10-30 - Version 1.3.8
 
 **Deutsch**

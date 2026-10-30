@@ -92,9 +92,9 @@ pre.code{text-align:left;white-space:pre-wrap;word-break:break-all;font-family:v
 
 #include "wiring_svg.h"
 
-static const char TAB_KEYS[][12] = {"sprechen", "radio", "sd", "mp3", "pins", "audio", "mqtt", "wlan", "zeit", "status", "log", "doku"};
-static const char* const TAB_LABELS[] = {"Sprechen", "Webradio", "SD-Karte", "MP3 (Flash)", "Eing&auml;nge", "Audio", "MQTT", "WLAN", "Zeit", "Status", "Log", "Doku"};
-static const char* const TAB_TIPS[] = {"Text ansagen, stoppen, Lautst&auml;rke", "Webradio-URL abspielen und bis zu 30 Sender speichern", "Dateien der SD-Karte abspielen, hochladen und verwalten", "MP3-Dateien im Ger&auml;t hochladen und abspielen", "Freie Pins mit Pull-up: bei Kontakt nach GND eine Ansage oder MP3-Datei abspielen", "Anschl&uuml;sse (Pins von Verst&auml;rker und SD-Karte), Lautst&auml;rke, &Uuml;berblenden, Start und Sprachausgabe (VoiceRSS)", "MQTT-Broker und Basis-Topic", "Hostname und WLAN-Zugangsdaten", "Zeitserver und Zeitzone", "Zustand des Ger&auml;ts", "Ereignisprotokoll", "Alle REST- und MQTT-Aufrufe zum Kopieren"};
+static const char TAB_KEYS[][12] = {"mp3", "sprechen", "sd", "radio", "pins", "audio", "mqtt", "wlan", "zeit", "status", "log", "doku"};
+static const char* const TAB_LABELS[] = {"MP3 (Flash)", "Sprechen", "SD-Karte", "Webradio", "Eing&auml;nge", "Audio", "MQTT", "WLAN", "Zeit", "Status", "Log", "Doku"};
+static const char* const TAB_TIPS[] = {"MP3-Dateien im Ger&auml;t hochladen und abspielen", "Text ansagen, stoppen, Lautst&auml;rke", "Dateien der SD-Karte abspielen, hochladen und verwalten", "Webradio-URL abspielen und bis zu 30 Sender speichern", "Freie Pins mit Pull-up: bei Kontakt nach GND eine Ansage oder MP3-Datei abspielen", "Anschl&uuml;sse (Pins von Verst&auml;rker und SD-Karte), Lautst&auml;rke, &Uuml;berblenden, Start und Sprachausgabe (VoiceRSS)", "MQTT-Broker und Basis-Topic", "Hostname und WLAN-Zugangsdaten", "Zeitserver und Zeitzone", "Zustand des Ger&auml;ts", "Ereignisprotokoll", "Alle REST- und MQTT-Aufrufe zum Kopieren"};
 static const int TAB_COUNT = 12;
 
 // ⓘ-Hinweis mit Erklaerung als Tooltip (title) - der Punkt am Satzende kommt hier dazu; im Text keine einfachen Anfuehrungszeichen.

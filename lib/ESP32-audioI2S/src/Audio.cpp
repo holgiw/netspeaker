@@ -19,7 +19,6 @@ char audioI2SVers[] = "\
 #include "aac_decoder/aac_decoder.h"
 #include "flac_decoder/flac_decoder.h"
 #include "mp3_decoder/mp3_decoder.h"
-#include "opus_decoder/opus_decoder.h"
 #include "psram_unique_ptr.hpp"
 #include "vorbis_decoder/vorbis_decoder.h"
 #include "wav_decoder/wav_decoder.h"
@@ -749,13 +748,12 @@ void Audio::destroy_decoder() {
     }
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-// Projektkopie: FLAC, AAC und WAV sind ausgebaut (kleinere Firmware).
-// Project copy: FLAC, AAC and WAV are removed (smaller firmware).
+// Projektkopie: FLAC, AAC, WAV und Opus sind ausgebaut (kleinere Firmware).
+// Project copy: FLAC, AAC, WAV and Opus are removed (smaller firmware).
 
 std::unique_ptr<Decoder> Audio::createDecoder(const std::string& type) {
     destroy_decoder();
     if (type == "MP3") return std::make_unique<MP3Decoder>(*this);
-    if (type == "OPUS") return std::make_unique<OpusDecoder>(*this);
     if (type == "VORBIS") return std::make_unique<VorbisDecoder>(*this);
     return nullptr;
 }
@@ -6002,10 +6000,6 @@ uint32_t Audio::decodeContinue(int8_t res, uint8_t* data, int32_t bytesDecoded, 
     if (m_codec == CODEC_FLAC) {
         if (res == FlacDecoder::FLAC_PARSE_OGG_DONE) return bytesDecoded;
         if (res == FlacDecoder::FLAC_DECODE_FRAMES_LOOP) return bytesDecoded;
-    } // nothing to play
-    if (m_codec == CODEC_OPUS) {
-        if (res == OpusDecoder::OPUS_PARSE_OGG_DONE) return bytesDecoded;
-        if (res == OpusDecoder::OPUS_END) return bytesDecoded;
     } // nothing to play
     if (m_codec == CODEC_VORBIS) {
         if (res == VorbisDecoder::VORBIS_PARSE_OGG_DONE) return bytesDecoded;

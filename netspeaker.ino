@@ -92,6 +92,36 @@ Preferences prefs;
 // Laufzeitzustand / runtime state
 
 enum PlayState { PS_IDLE, PS_LOADING, PS_PLAYING };
+// Eine Mischspur: Ringpuffer, Zeiger und Zustand (siehe Mischer weiter unten); Spur 0 = Datei der SD-Karte ueber dem Radio, Spur 1 = Ansage.
+// One mix track: ring buffer, pointers and state (see mixer further down); track 0 = file of the SD card over the radio, track 1 = announcement.
+
+#define MIX_LAYER 0
+#define MIX_ANN 1
+
+struct MixTrack {
+    int16_t* ring = nullptr;
+    std::atomic<uint32_t> wr{0};
+    std::atomic<uint32_t> rd{0};
+    volatile bool active = false;
+    volatile bool inUse = false;
+    volatile bool producerDone = false;
+    volatile bool abortFlag = false;
+    volatile bool taskRunning = false;
+    volatile bool drained = false;
+    volatile bool inHook = false;
+    volatile uint32_t srcRate = 0;
+    volatile uint32_t outRate = 44100;
+    volatile uint32_t phase = 0;
+    volatile int32_t gainQ15 = 0;
+    int32_t baseGainQ15 = 0;
+    String path;
+    bool onSd = false;
+    bool pending = false;
+    unsigned long activateAt = 0;
+    uint32_t lastRd = 0;
+    unsigned long lastProgress = 0;
+};
+
 enum PendingType { PEND_NONE, PEND_SAY, PEND_URL, PEND_FILE, PEND_STOP };
 
 struct Pending {
@@ -582,7 +612,7 @@ void loadSettings() {
 
 void publishStatus(bool force = false);
 void onAudioEvent(Audio::msg_t m);
-void mixStop();
+void mixStopAll();
 
 // Die Audio-Bibliothek ruft den Rueckruf aus ihrem eigenen Task auf. Dort wird nur in eine Warteschlange geschrieben,
 // die Hauptschleife arbeitet die Ereignisse ab; so greifen nie zwei Tasks auf Strings, MQTT oder den Zustand zu.
@@ -689,7 +719,7 @@ void ensureAudio() {
 }
 
 void releaseAudio() {
-    mixStop();
+    mixStopAll();
     if (!audio) return;
     audio->stopSong();
     delete audio;
@@ -819,7 +849,7 @@ void settleVolume() {
 }
 
 void setIdle() {
-    mixStop();
+    mixStopAll();
     titleBoostEnd();
     streamWaitingReady = false;
     playState = PS_IDLE;
@@ -830,7 +860,7 @@ void setIdle() {
 }
 
 void stopPlayback() {
-    mixStop();
+    mixStopAll();
     titleBoostEnd();
     if (audio) audio->stopSong();
     if (audioEvtQueue) xQueueReset(audioEvtQueue);
@@ -1599,32 +1629,21 @@ String buildSpeechUrl(const Pending& p) {
 
 // Mischer: Eine Ansage oder MP3-Datei wird in einem eigenen Task dekodiert und im Audio-Task zum laufenden Webradio addiert.
 // Das Radio laeuft ohne Unterbrechung weiter und ist waehrenddessen leiser (Ducking).
+// Es gibt zwei Mischspuren: Spur 0 traegt eine Datei der SD-Karte ueber dem Radio, Spur 1 eine Ansage (Flash-MP3 oder Sprechen).
+// Kommt eine Ansage, senkt sich Spur 0 ab und spielt danach weiter.
 // Mixer: an announcement or MP3 file is decoded in its own task and added to the running web radio in the audio task.
 // The radio keeps playing without interruption and is quieter meanwhile (ducking).
+// There are two mix tracks: track 0 carries a file of the SD card over the radio, track 1 an announcement (flash MP3 or speech).
+// When an announcement comes, track 0 is lowered and continues afterwards.
 
 #define MIX_RING_FRAMES 16384
 #define MIX_RING_MASK (MIX_RING_FRAMES - 1)
 
-int16_t* mixRing = nullptr;
-std::atomic<uint32_t> mixWr(0);
-std::atomic<uint32_t> mixRd(0);
-volatile bool mixActive = false;
-volatile bool mixInUse = false;
-volatile bool mixProducerDone = false;
-volatile bool mixAbortFlag = false;
-volatile bool mixTaskRunning = false;
-volatile bool mixDrained = false;
-volatile uint32_t mixSrcRate = 0;
-volatile uint32_t mixOutRate = 44100;
-volatile uint32_t mixPhase = 0;
-volatile int32_t mixGainQ15 = 0;
-String mixPath;
-bool mixOnSd = false;
-volatile bool mixInHook = false;
-bool mixPending = false;
-unsigned long mixActivateAt = 0;
-uint32_t mixLastRd = 0;
-unsigned long mixLastProgress = 0;
+MixTrack mixT[2];
+
+bool mixAny() {
+    return mixT[0].inUse || mixT[1].inUse;
+}
 
 // Lautstaerkekurve der Audio-Bibliothek (VOLUME_MAX Stufen, -60 bis 0 dB), damit Ansage und Radio gleich laut klingen.
 // Volume curve of the audio library (VOLUME_MAX steps, -60 to 0 dB), so announcement and radio sound equally loud.
@@ -1639,39 +1658,30 @@ int32_t mixGainFor(int vol) {
     return (int32_t)(powf(10.0f, dB / 20.0f) * 32768.0f);
 }
 
-// Wird im Audio-Task vor jeder I2S-Ausgabe aufgerufen: addiert die Ansage (umgerechnet auf die Rate des Radios) zu den Radio-Samples.
-// Called in the audio task before every I2S output: adds the announcement (converted to the rate of the radio) to the radio samples.
+// Addiert eine Mischspur (umgerechnet auf die Rate des Radios) zu den Samples des Audio-Tasks.
+// Adds one mix track (converted to the rate of the radio) to the samples of the audio task.
 
-void audio_process_i2s(int32_t* buf, int16_t words, bool* continueI2S) {
-    int32_t fg = fileGainQ15;
-    if (fileGainOn && fg != 32768) {
-        for (int i = 0; i < words; i++) {
-            int64_t v = ((int64_t)buf[i] * fg) >> 15;
-            if (v > INT32_MAX) v = INT32_MAX;
-            if (v < INT32_MIN) v = INT32_MIN;
-            buf[i] = (int32_t)v;
-        }
-    }
-    if (!mixActive) return;
-    mixInHook = true;
-    int16_t* ring = mixRing;
-    uint32_t srcRate = mixSrcRate;
-    uint32_t outRate = mixOutRate;
-    if (!mixActive || !ring || srcRate == 0 || outRate == 0) {
-        mixInHook = false;
+static void mixAddTrack(MixTrack& m, int32_t* buf, int16_t words) {
+    if (!m.active) return;
+    m.inHook = true;
+    int16_t* ring = m.ring;
+    uint32_t srcRate = m.srcRate;
+    uint32_t outRate = m.outRate;
+    if (!m.active || !ring || srcRate == 0 || outRate == 0) {
+        m.inHook = false;
         return;
     }
     uint32_t step = (uint32_t)(((uint64_t)srcRate << 16) / outRate);
-    uint32_t rd = mixRd.load(std::memory_order_relaxed);
-    uint32_t wr = mixWr.load(std::memory_order_acquire);
-    uint32_t phase = mixPhase;
-    int32_t g = mixGainQ15;
+    uint32_t rd = m.rd.load(std::memory_order_relaxed);
+    uint32_t wr = m.wr.load(std::memory_order_acquire);
+    uint32_t phase = m.phase;
+    int32_t g = m.gainQ15;
     int frames = words / 2;
     for (int i = 0; i < frames; i++) {
         if (wr - rd < 2) {
-            wr = mixWr.load(std::memory_order_acquire);
+            wr = m.wr.load(std::memory_order_acquire);
             if (wr - rd < 2) {
-                if (mixProducerDone) mixDrained = true;
+                if (m.producerDone) m.drained = true;
                 break;
             }
         }
@@ -1692,9 +1702,26 @@ void audio_process_i2s(int32_t* buf, int16_t words, bool* continueI2S) {
         rd += phase >> 16;
         phase &= 0xFFFF;
     }
-    mixPhase = phase;
-    mixRd.store(rd, std::memory_order_release);
-    mixInHook = false;
+    m.phase = phase;
+    m.rd.store(rd, std::memory_order_release);
+    m.inHook = false;
+}
+
+// Wird im Audio-Task vor jeder I2S-Ausgabe aufgerufen: addiert beide Mischspuren zu den Radio-Samples.
+// Called in the audio task before every I2S output: adds both mix tracks to the radio samples.
+
+void audio_process_i2s(int32_t* buf, int16_t words, bool* continueI2S) {
+    int32_t fg = fileGainQ15;
+    if (fileGainOn && fg != 32768) {
+        for (int i = 0; i < words; i++) {
+            int64_t v = ((int64_t)buf[i] * fg) >> 15;
+            if (v > INT32_MAX) v = INT32_MAX;
+            if (v < INT32_MIN) v = INT32_MIN;
+            buf[i] = (int32_t)v;
+        }
+    }
+    mixAddTrack(mixT[MIX_LAYER], buf, words);
+    mixAddTrack(mixT[MIX_ANN], buf, words);
 }
 
 // Lese-Task: MP3 aus dem Dateisystem lesen, mit dem Dekoder der Bibliothek in PCM wandeln und in den Ringpuffer schreiben.
@@ -1703,21 +1730,22 @@ void audio_process_i2s(int32_t* buf, int16_t words, bool* continueI2S) {
 // Lesen aus der Datei des Mischers; auf der SD-Karte unter dem Sperrzeichen, weil die Weboberflaeche sie zugleich auflisten kann.
 // Reading from the file of the mixer; on the SD card under the lock because the web interface may list it at the same time.
 
-int mixRead(File& f, uint8_t* buf, size_t len) {
-    if (mixOnSd) xSemaphoreTake(sdMutex, portMAX_DELAY);
+int mixRead(bool onSd, File& f, uint8_t* buf, size_t len) {
+    if (onSd) xSemaphoreTake(sdMutex, portMAX_DELAY);
     int n = f.read(buf, len);
-    if (mixOnSd) xSemaphoreGive(sdMutex);
+    if (onSd) xSemaphoreGive(sdMutex);
     return n;
 }
 
-void mixSeek(File& f, uint32_t pos) {
-    if (mixOnSd) xSemaphoreTake(sdMutex, portMAX_DELAY);
+void mixSeek(bool onSd, File& f, uint32_t pos) {
+    if (onSd) xSemaphoreTake(sdMutex, portMAX_DELAY);
     f.seek(pos);
-    if (mixOnSd) xSemaphoreGive(sdMutex);
+    if (onSd) xSemaphoreGive(sdMutex);
 }
 
-void mixTask(void*) {
-    File f = mixOnSd ? SD.open(mixPath.c_str(), FILE_READ) : LittleFS.open(mixPath, FILE_READ);
+void mixTask(void* arg) {
+    MixTrack& m = *(MixTrack*)arg;
+    File f = m.onSd ? SD.open(m.path.c_str(), FILE_READ) : LittleFS.open(m.path, FILE_READ);
     uint8_t* in = (uint8_t*)malloc(MIX_IN_BYTES);
     int32_t* out = (int32_t*)malloc(1152 * 2 * sizeof(int32_t));
     MP3Decoder* dec = nullptr;
@@ -1730,19 +1758,19 @@ void mixTask(void*) {
     }
     if (dec) {
         uint8_t hdr[10];
-        if (mixRead(f, hdr, 10) == 10 && memcmp(hdr, "ID3", 3) == 0) {
+        if (mixRead(m.onSd, f, hdr, 10) == 10 && memcmp(hdr, "ID3", 3) == 0) {
             uint32_t sz = ((uint32_t)(hdr[6] & 0x7f) << 21) | ((uint32_t)(hdr[7] & 0x7f) << 14) | ((uint32_t)(hdr[8] & 0x7f) << 7) | (uint32_t)(hdr[9] & 0x7f);
-            mixSeek(f, 10 + sz);
+            mixSeek(m.onSd, f, 10 + sz);
         } else {
-            mixSeek(f, 0);
+            mixSeek(m.onSd, f, 0);
         }
         int have = 0;
         bool eof = false;
         bool first = true;
         int errors = 0;
-        while (!mixAbortFlag) {
+        while (!m.abortFlag) {
             if (have < MIX_REFILL_BELOW && !eof) {
-                int n = mixRead(f, in + have, MIX_IN_BYTES - have);
+                int n = mixRead(m.onSd, f, in + have, MIX_IN_BYTES - have);
                 if (n <= 0) eof = true;
                 else have += n;
             }
@@ -1765,18 +1793,18 @@ void mixTask(void*) {
                 if (frames > 1152) frames = 1152;
                 if (frames > 0) {
                     if (first) {
-                        mixSrcRate = dec->getSampleRate();
+                        m.srcRate = dec->getSampleRate();
                         first = false;
                     }
-                    while (!mixAbortFlag && MIX_RING_FRAMES - (mixWr.load(std::memory_order_relaxed) - mixRd.load(std::memory_order_acquire)) < frames + 1) vTaskDelay(3);
-                    if (mixAbortFlag) break;
-                    uint32_t w = mixWr.load(std::memory_order_relaxed);
+                    while (!m.abortFlag && MIX_RING_FRAMES - (m.wr.load(std::memory_order_relaxed) - m.rd.load(std::memory_order_acquire)) < frames + 1) vTaskDelay(3);
+                    if (m.abortFlag) break;
+                    uint32_t w = m.wr.load(std::memory_order_relaxed);
                     for (uint32_t i = 0; i < frames; i++) {
-                        int16_t* d = mixRing + ((w + i) & MIX_RING_MASK) * 2;
+                        int16_t* d = m.ring + ((w + i) & MIX_RING_MASK) * 2;
                         d[0] = (int16_t)(out[2 * i] >> 16);
                         d[1] = (int16_t)(out[2 * i + 1] >> 16);
                     }
-                    mixWr.store(w + frames, std::memory_order_release);
+                    m.wr.store(w + frames, std::memory_order_release);
                 }
                 errors = 0;
             } else if (++errors > 100) {
@@ -1793,94 +1821,145 @@ void mixTask(void*) {
     if (f) f.close();
     free(in);
     free(out);
-    mixProducerDone = true;
-    mixTaskRunning = false;
+    m.producerDone = true;
+    m.taskRunning = false;
     vTaskDelete(nullptr);
 }
 
-// Haelt den Mischer an: Task beenden, Speicher freigeben; die Radio-Lautstaerke bleibt unveraendert.
-// Halts the mixer: end the task, free the memory; the radio volume stays unchanged.
+// Absenken der Spur 0 (Datei der SD-Karte), solange eine Ansage laeuft: weicher Verlauf ueber die Dauer des Ab- und Aufblendens.
+// Lowering of track 0 (file of the SD card) while an announcement runs: smooth ramp over the duration of fading down and up.
 
-void mixHalt() {
-    if (!mixInUse) return;
-    mixActive = false;
-    mixPending = false;
-    mixAbortFlag = true;
-    for (int i = 0; i < 100 && mixTaskRunning; i++) delay(10);
-    mixAbortFlag = false;
-    for (int i = 0; i < 50 && mixInHook; i++) delay(2);
-    delay(5);
-    if (mixRing) {
-        heap_caps_free(mixRing);
-        mixRing = nullptr;
-    }
-    mixInUse = false;
+struct LayerRamp {
+    bool on = false;
+    int32_t from = 0;
+    int32_t to = 0;
+    unsigned long t0 = 0;
+    int ms = 0;
+};
+LayerRamp layRamp;
+
+void layerDuck(bool down) {
+    MixTrack& m = mixT[MIX_LAYER];
+    if (!m.inUse) return;
+    layRamp.from = m.gainQ15;
+    layRamp.to = down ? (int32_t)((int64_t)m.baseGainQ15 * cfg.duckPct / 100) : m.baseGainQ15;
+    layRamp.t0 = millis();
+    layRamp.ms = cfg.fadeMs;
+    layRamp.on = true;
 }
 
-// Beendet den Mischer und blendet das Radio wieder auf die vorherige Lautstaerke auf.
-// Ends the mixer and fades the radio back up to its previous volume.
+void layerRampStep() {
+    if (!layRamp.on) return;
+    MixTrack& m = mixT[MIX_LAYER];
+    if (!m.inUse) {
+        layRamp.on = false;
+        return;
+    }
+    unsigned long dt = millis() - layRamp.t0;
+    int32_t v = layRamp.to;
+    if (layRamp.ms > 0 && dt < (unsigned long)layRamp.ms) v = layRamp.from + (int32_t)((int64_t)(layRamp.to - layRamp.from) * (int64_t)dt / layRamp.ms);
+    m.gainQ15 = v;
+    if (dt >= (unsigned long)layRamp.ms) layRamp.on = false;
+}
 
-void mixStop() {
-    bool was = mixInUse;
-    mixHalt();
-    if (mixDucked && annCount == 0) {
+// Haelt eine Mischspur an: Task beenden, Speicher freigeben; die Radio-Lautstaerke bleibt unveraendert.
+// Halts a mix track: end the task, free the memory; the radio volume stays unchanged.
+
+void mixHalt(int t) {
+    MixTrack& m = mixT[t];
+    if (!m.inUse) return;
+    m.active = false;
+    m.pending = false;
+    m.abortFlag = true;
+    for (int i = 0; i < 100 && m.taskRunning; i++) delay(10);
+    m.abortFlag = false;
+    for (int i = 0; i < 50 && m.inHook; i++) delay(2);
+    delay(5);
+    if (m.ring) {
+        heap_caps_free(m.ring);
+        m.ring = nullptr;
+    }
+    m.inUse = false;
+    if (t == MIX_LAYER) layRamp.on = false;
+}
+
+// Beendet eine Mischspur; sind beide frei und wartet nichts, blendet das Radio wieder auf die vorherige Lautstaerke auf.
+// Ends a mix track; if both are free and nothing is waiting, the radio fades back up to its previous volume.
+
+void mixStop(int t) {
+    bool was = mixT[t].inUse;
+    mixHalt(t);
+    if (t == MIX_ANN && annCount == 0) layerDuck(false);
+    bool radioBack = false;
+    if (mixDucked && annCount == 0 && !mixAny()) {
         volRampTo(currentVolume * VOL_FINE, cfg.fadeMs);
         mixDucked = false;
+        radioBack = true;
     }
-    if (was) logLine(annCount > 0 ? String("[MIX] announcement finished, next one waiting, radio stays lowered") : "[MIX] announcement finished, radio back to volume " + String(currentVolume));
+    if (!was) return;
+    if (t == MIX_LAYER) logLine(radioBack ? "[MIX] card file over the radio finished, radio back to volume " + String(currentVolume) : String("[MIX] card file over the radio finished"));
+    else logLine(annCount > 0 ? String("[MIX] announcement finished, next one waiting, radio stays lowered") : "[MIX] announcement finished, radio back to volume " + String(currentVolume));
 }
 
-// Startet den Mischer fuer eine MP3-Datei; false, wenn Speicher oder Dekoder fehlen (dann gilt der normale Weg ueber Unterbrechen).
-// Starts the mixer for an MP3 file; false if memory or decoder is missing (the normal way via interrupting then applies).
+void mixStopAll() {
+    mixStop(MIX_ANN);
+    mixStop(MIX_LAYER);
+}
 
-// Blendet eine laufende Mischspur kurz aus (100 ms), bevor sie von einer wichtigeren ersetzt wird.
-// Fades a running mix layer out briefly (100 ms) before a more important one replaces it.
+// Blendet die laufende Ansage kurz aus (100 ms), bevor eine neue sie ersetzt.
+// Fades the running announcement out briefly (100 ms) before a new one replaces it.
 
 void mixQuickFade() {
-    if (!mixInUse || !mixActive) return;
-    int32_t g0 = mixGainQ15;
+    MixTrack& m = mixT[MIX_ANN];
+    if (!m.inUse || !m.active) return;
+    int32_t g0 = m.gainQ15;
     for (int i = 9; i >= 0; i--) {
-        mixGainQ15 = (int32_t)((int64_t)g0 * i / 10);
+        m.gainQ15 = (int32_t)((int64_t)g0 * i / 10);
         delay(10);
         esp_task_wdt_reset();
     }
 }
 
-bool mixStart(const String& path, int vol, bool sd = false) {
-    mixQuickFade();
-    mixHalt();
+// Startet eine Mischspur fuer eine MP3-Datei; false, wenn Speicher oder Dekoder fehlen (dann gilt der normale Weg ueber Unterbrechen).
+// Starts a mix track for an MP3 file; false if memory or decoder is missing (the normal way via interrupting then applies).
+
+bool mixStart(int t, const String& path, int vol, bool sd = false) {
+    MixTrack& m = mixT[t];
+    if (t == MIX_ANN) mixQuickFade();
+    mixHalt(t);
     if (!audio) return false;
-    mixRing = (int16_t*)heap_caps_malloc(MIX_RING_FRAMES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!mixRing) return false;
-    mixInUse = true;
-    mixPath = path;
-    mixOnSd = sd;
-    mixWr = 0;
-    mixRd = 0;
-    mixPhase = 0;
-    mixSrcRate = 0;
-    mixDrained = false;
-    mixProducerDone = false;
-    mixAbortFlag = false;
-    mixOutRate = audio->getSampleRate();
-    mixGainQ15 = mixGainFor(vol);
-    mixTaskRunning = true;
-    if (mixOutRate == 0 || xTaskCreatePinnedToCore(mixTask, "mixdec", 12288, nullptr, 1, nullptr, 1) != pdPASS) {
-        mixTaskRunning = false;
-        mixStop();
+    m.ring = (int16_t*)heap_caps_malloc(MIX_RING_FRAMES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!m.ring) return false;
+    m.inUse = true;
+    m.path = path;
+    m.onSd = sd;
+    m.wr = 0;
+    m.rd = 0;
+    m.phase = 0;
+    m.srcRate = 0;
+    m.drained = false;
+    m.producerDone = false;
+    m.abortFlag = false;
+    m.outRate = audio->getSampleRate();
+    m.baseGainQ15 = mixGainFor(vol);
+    m.gainQ15 = m.baseGainQ15;
+    m.taskRunning = true;
+    if (m.outRate == 0 || xTaskCreatePinnedToCore(mixTask, t == MIX_LAYER ? "mixlay" : "mixann", 12288, &m, 1, nullptr, 1) != pdPASS) {
+        m.taskRunning = false;
+        mixStop(t);
         return false;
     }
     unsigned long t0 = millis();
-    while (millis() - t0 < 1500 && mixTaskRunning && (mixWr.load() - mixRd.load()) < MIX_PREFILL_FRAMES) {
+    while (millis() - t0 < 1500 && m.taskRunning && (m.wr.load() - m.rd.load()) < MIX_PREFILL_FRAMES) {
         delay(5);
         esp_task_wdt_reset();
     }
-    if (mixWr.load() < 2) {
-        mixStop();
+    if (m.wr.load() < 2) {
+        mixStop(t);
         return false;
     }
-    mixLastRd = 0;
-    mixLastProgress = millis();
+    m.lastRd = 0;
+    m.lastProgress = millis();
     int duck = currentVolume * VOL_FINE * cfg.duckPct / 100;
 
     // War das Radio oder die Datei schon beim Aufruf abgesenkt (Ansage), startet die Ansage ohne weitere Wartezeit.
@@ -1893,9 +1972,10 @@ bool mixStart(const String& path, int vol, bool sd = false) {
         mixDuckAt = millis();
     }
     mixDucked = true;
-    mixPending = true;
-    mixActivateAt = millis() + (since >= lead ? 0 : lead - since);
-    logLine("[MIX] " + path + " mixed over the running audio, announcement volume " + String(vol) + ", radio " + String(currentVolume) + " -> " + String(duck / VOL_FINE) + ", source " + String(mixSrcRate) + " Hz, output " + String(mixOutRate) + " Hz");
+    if (t == MIX_ANN) layerDuck(true);
+    m.pending = true;
+    m.activateAt = millis() + (since >= lead ? 0 : lead - since);
+    logLine("[MIX] " + path + " mixed over the running audio, " + String(t == MIX_LAYER ? "file" : "announcement") + " volume " + String(vol) + ", radio " + String(currentVolume) + " -> " + String(duck / VOL_FINE) + ", source " + String(m.srcRate) + " Hz, output " + String(m.outRate) + " Hz");
     return true;
 }
 
@@ -1914,32 +1994,37 @@ bool mixPossible() {
 void announceFail(const String& msg) {
     lastError = msg;
     logLine("[PLAY] " + msg);
-    if (mixDucked && annCount == 0) {
+    if (annCount == 0) layerDuck(false);
+    if (mixDucked && annCount == 0 && !mixAny()) {
         volRampTo(currentVolume * VOL_FINE, cfg.fadeMs);
         mixDucked = false;
     }
     publishStatus(true);
 }
 
-// Prueft laufend, ob die Ansage zu Ende ist oder der Mischer haengt.
-// Continuously checks whether the announcement has ended or the mixer is stuck.
+// Prueft laufend, ob eine Mischspur zu Ende ist oder haengt.
+// Continuously checks whether a mix track has ended or is stuck.
 
 void mixWatch() {
     volRampStep();
-    if (!mixInUse) return;
-    if (mixPending && millis() >= mixActivateAt) {
-        mixPending = false;
-        mixActive = true;
-        mixLastProgress = millis();
+    layerRampStep();
+    for (int t = 0; t < 2; t++) {
+        MixTrack& m = mixT[t];
+        if (!m.inUse) continue;
+        if (m.pending && millis() >= m.activateAt) {
+            m.pending = false;
+            m.active = true;
+            m.lastProgress = millis();
+        }
+        uint32_t rd = m.rd.load();
+        if (rd != m.lastRd) {
+            m.lastRd = rd;
+            m.lastProgress = millis();
+        }
+        bool empty = m.producerDone && (m.wr.load() - rd) < 2;
+        bool stuck = m.active && (m.wr.load() - rd) > 0 && millis() - m.lastProgress > 4000;
+        if (empty || m.drained || stuck || !audio || playState != PS_PLAYING || !(streamActive || nowKind == "file")) mixStop(t);
     }
-    uint32_t rd = mixRd.load();
-    if (rd != mixLastRd) {
-        mixLastRd = rd;
-        mixLastProgress = millis();
-    }
-    bool empty = mixProducerDone && (mixWr.load() - rd) < 2;
-    bool stuck = mixActive && (mixWr.load() - rd) > 0 && millis() - mixLastProgress > 4000;
-    if (empty || mixDrained || stuck || !audio || playState != PS_PLAYING || !(streamActive || nowKind == "file")) mixStop();
 }
 
 // Waehrend der Text geladen wird, blockiert die Hauptschleife; ein kleiner Task fuehrt das Absenken in dieser Zeit weiter, damit es sanft bleibt.
@@ -1951,6 +2036,7 @@ volatile bool duckWorkerDone = true;
 void duckWorker(void*) {
     while (duckWorkerRun) {
         volRampStep();
+        layerRampStep();
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     duckWorkerDone = true;
@@ -1984,7 +2070,7 @@ bool speakMixed(const Pending& p) {
         return true;
     }
     mixQuickFade();
-    mixHalt();
+    mixHalt(MIX_ANN);
     lastError = "";
 
     // Radio oder Datei sofort absenken, damit die Ansage nach dem Laden gleich zu hoeren ist.
@@ -1995,6 +2081,7 @@ bool speakMixed(const Pending& p) {
         mixDucked = true;
         mixDuckAt = millis();
     }
+    layerDuck(true);
     voiceBusy = true;
     voiceEver = true;
     publishStatus(true);
@@ -2012,7 +2099,7 @@ bool speakMixed(const Pending& p) {
         announceFail("Radio stopped while the announcement was loading");
         return true;
     }
-    if (!mixStart(TTS_FILE, p.vol >= 0 ? p.vol : cfg.vol)) {
+    if (!mixStart(MIX_ANN, TTS_FILE, p.vol >= 0 ? p.vol : cfg.vol)) {
         announceFail("Mixer not available");
         return true;
     }
@@ -2030,7 +2117,11 @@ bool fileMixed(const Pending& p) {
         return true;
     }
     lastError = "";
-    if (!mixStart(r.path, p.vol >= 0 ? p.vol : cfg.vol, r.sd)) return false;
+
+    // Eine Datei der Karte ueber dem Radio liegt auf Spur 0 und wird von einer Ansage abgesenkt; alles andere ist eine Ansage (Spur 1).
+    // A file of the card over the radio goes on track 0 and is lowered by an announcement; everything else is an announcement (track 1).
+
+    if (!mixStart((r.sd && streamActive) ? MIX_LAYER : MIX_ANN, r.path, p.vol >= 0 ? p.vol : cfg.vol, r.sd)) return false;
 
     // Laeuft schon eine Datei, bleibt sie die angezeigte; nur ueber einem Radio steht die gemischte Datei in nowFile.
     // If a file is already playing it stays the one shown; only over a radio the mixed file goes into nowFile.
@@ -2044,7 +2135,9 @@ bool fileMixed(const Pending& p) {
 // Ends playback and mixer that are reading from the card right now (before mounting again).
 
 void sdStopAll() {
-    if (mixInUse && mixOnSd) mixStop();
+    for (int t = 0; t < 2; t++) {
+        if (mixT[t].inUse && mixT[t].onSd) mixStop(t);
+    }
     if (nowKind == "file" && playState != PS_IDLE && nowFile.startsWith("sd:")) stopPlayback();
 }
 
@@ -2053,7 +2146,9 @@ void sdStopAll() {
 
 void sdStopIfUsing(const String& path) {
     String shown = "sd:" + path;
-    if (mixInUse && mixOnSd && (mixPath == path || mixPath.startsWith(path + "/"))) mixStop();
+    for (int t = 0; t < 2; t++) {
+        if (mixT[t].inUse && mixT[t].onSd && (mixT[t].path == path || mixT[t].path.startsWith(path + "/"))) mixStop(t);
+    }
     if (nowKind == "file" && playState != PS_IDLE && (nowFile == shown || nowFile.startsWith(shown + "/"))) stopPlayback();
 }
 
@@ -2062,7 +2157,9 @@ void sdStopIfUsing(const String& path) {
 
 void stopIfUsing(const String& name) {
     String path = String(MP3_DIR) + "/" + name;
-    if (mixInUse && mixPath == path) mixStop();
+    for (int t = 0; t < 2; t++) {
+        if (mixT[t].inUse && mixT[t].path == path) mixStop(t);
+    }
     if (nowKind == "file" && nowFile == name && playState != PS_IDLE) stopPlayback();
 }
 
@@ -2156,7 +2253,7 @@ void fadeOutStream(int ms) {
 // Is no announcement or file running right now (and none being loaded or mixed)?
 
 bool announceBusy() {
-    return voiceBusy || mixInUse || ((nowKind == "speech" || nowKind == "file") && playState != PS_IDLE);
+    return voiceBusy || mixAny() || ((nowKind == "speech" || nowKind == "file") && playState != PS_IDLE);
 }
 
 // Ist p eine MP3-Datei aus dem Flash, waehrend gerade eine MP3-Datei von der SD-Karte spielt? Dann wird sie sofort ueber die Karte gemischt.
@@ -2175,12 +2272,14 @@ bool flashMp3(const Pending& p) {
 }
 
 // Rangfolge von hoch nach niedrig: 1. MP3 aus dem Flash, 2. Sprechen, 3. MP3 von der SD-Karte, 4. Webradio.
-// 1 und 2 spielen nacheinander und senken 3 und 4 ab. Laeuft eine SD-Datei als Mischspur ueber dem Radio, ersetzt eine Flash-MP3 oder ein Text diese Spur.
+// 1 und 2 spielen nacheinander und senken 3 und 4 ab. Laeuft eine SD-Datei als Mischspur ueber dem Radio, kommt eine Flash-MP3 oder ein Text
+// sofort auf die freie Ansage-Spur; SD-Datei und Radio werden abgesenkt und spielen danach weiter.
 // Priority from high to low: 1. MP3 from the flash, 2. speech, 3. MP3 from the SD card, 4. web radio.
-// 1 and 2 play one after the other and lower 3 and 4. If an SD file runs as a mix layer over the radio, a flash MP3 or a text replaces that layer.
+// 1 and 2 play one after the other and lower 3 and 4. If an SD file runs as a mix track over the radio, a flash MP3 or a text goes
+// onto the free announcement track right away; SD file and radio are lowered and continue afterwards.
 
 bool preempts(const Pending& p) {
-    if (!mixInUse || !mixOnSd || playState != PS_PLAYING || !mixPossible()) return false;
+    if (!mixT[MIX_LAYER].inUse || mixT[MIX_ANN].inUse || voiceBusy || playState != PS_PLAYING || !mixPossible()) return false;
     return p.type == PEND_SAY || flashMp3(p);
 }
 
@@ -2211,7 +2310,7 @@ void processQueue() {
         }
     }
 
-    if (!voiceBusy && !mixInUse && nowKind == "file" && mixPossible()) {
+    if (!voiceBusy && !mixAny() && nowKind == "file" && mixPossible()) {
         for (int i = 0; i < annCount; i++) {
             if (((annQueue[i].type == PEND_SAY && nowFile.startsWith("sd:")) || flashOverSd(annQueue[i])) && annTake(i, next)) {
                 pending = next;
@@ -2255,8 +2354,9 @@ void processPending() {
     }
     if (flashOverSd(p)) mixable = true;
 
-    if (mixInUse && !(mixable && mixPossible())) {
-        mixHalt();
+    if (mixAny() && !(mixable && mixPossible())) {
+        mixHalt(MIX_LAYER);
+        mixHalt(MIX_ANN);
         mixDucked = false;
         volRamp.on = false;
     }
@@ -2471,7 +2571,7 @@ bool titleRuleMatch(const String& title, String& keywordOut, int& volOut) {
 }
 
 void titleRule(const String& title) {
-    if (mixInUse) return;
+    if (mixAny()) return;
     String keyword;
     int vol = cfg.titleVol;
     bool hit = nowKind == "radio" && cfg.titleMatch.length() > 0 && title.length() > 0 && titleRuleMatch(title, keyword, vol);
@@ -3467,7 +3567,7 @@ void logWatch() {
 
 void ledWatch() {
     static int last = -1;
-    int on = (voiceBusy || mixInUse || (nowKind == "speech" && playState != PS_IDLE)) ? 1 : 0;
+    int on = (voiceBusy || mixAny() || (nowKind == "speech" && playState != PS_IDLE)) ? 1 : 0;
     if (on == last) return;
     last = on;
 #if defined(RGB_BUILTIN)
